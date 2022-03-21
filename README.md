@@ -11,10 +11,10 @@ The `data/` folder contains two files. The file `example_data.rds` contains a da
 The `Rmd/` folder contains three Rmarkdown files:
 
 - __01-covariance_centering__: Contains a detailed walkthrough, with example code, of the covariance centering procedure used in the manuscript.
-- __02-manifold_excursion__: Computed resting state manifold excursion and implements a functional PCA of subject excursion curves.
+- __02-manifold_excursion__: Computes resting state manifold excursion and implements a functional PCA of subject excursion curves.
 - __03-covariance_embedding__: Performs a joint embedding of the centered covariance data computed in `01-covariance_centering`
 
-Note that the embedding itself is performed using the code provided by Wang et al. (2017), and published in a repository at https://github.com/shangsiwang/Joint-Embedding. As the code is not released with any open license, the script is not  included here. It can be downloaded from the linked repository and placed in the `R/` subdirectory.
+Note that the embedding itself is performed using the code provided by Wang et al. (2017), and published in a repository at https://github.com/shangsiwang/Joint-Embedding. As the code is not released with any open license, the script is not included here. It can be downloaded from the linked repository and placed in the `R/` subdirectory.
 
 The compiled html files are included in the `guides/` directory.
 
