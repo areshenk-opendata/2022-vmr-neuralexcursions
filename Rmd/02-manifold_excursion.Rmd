@@ -1,0 +1,255 @@
+---
+title: "02-manifold_excursion"
+author: "Corson N. Areshenkoff"
+date: "18/03/2022"
+output: html_document
+---
+    
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Required packages
+```{r, message=FALSE}
+library(zoo)
+library(plyr)
+library(ggplot2)
+
+# For computing generalized inverses
+library(MASS)
+
+# Used for functional PCA
+library(fda)
+```
+
+## Data
+
+The file `data/guides/example_data.rds` contains example BOLD data
+from 4 subjects, each with rest and task scans. The data are stored in a dataframe
+with columns for `Subject`, `Scan`, and `Data`; the latter containing TR x ROI
+matrices of (standardized) BOLD data.
+```{r}
+df <- readRDS('../data/example_data.rds')
+```
+
+## Excursion
+
+Our measure of excursion is calculated first by estimating a subspace capturing
+the dominant patterns of variability in a subject's resting state BOLD data, and
+then by computing, at each imaging volume, the distance between task BOLD
+activation and the resting state manifold.
+
+### Workflow for a single subject
+
+We experimented with several methods for estimating the dimension of a subject's
+resting state manifold, all with similar results, and so we follow the manuscript
+and select enough components to account for 75% of the resting state BOLD 
+variability.
+
+```{r}
+resting.state <- subset(df, Scan == 'Rest' & Subject == 'S1')$Data[[1]]
+fit.svd <- svd(resting.state)
+
+# Examine variance explained by each singular vector
+eigs      <- fit.svd$d^2
+var.exp   <- cumsum(eigs)/sum(eigs)
+dimension <- min(which(var.exp >= .75))
+
+# Extract the leading right singular vectors, giving a basis for the resting
+# state subspace
+V <- fit.svd$v[,1:dimension]
+```
+
+We then separate the on- and off-manifold components of the task BOLD signal
+by projecting each BOLD activation vector onto, respectively,  the subspace 
+spanned by V, and it's orthogonal complement.
+
+```{r}
+# Projection matrix for the subspace spanned by V
+P.on <- V %*% ginv(t(V) %*% V) %*% t(V)
+
+# Projection onto the orthogonal complement
+I <- diag(nrow(V))
+P.off <- I - V %*% ginv(t(V) %*% V) %*% t(V)
+
+# On- and off- manifold projection of the task BOLD signal
+bold.data <- subset(df, Scan == 'Task' & Subject == 'S1')$Data[[1]]
+bold.on.manifold  <- bold.data %*% P.on
+bold.off.manifold <- bold.data %*% P.off
+```
+
+We define the "off-manifold activation" to be the norm of the off-manifold 
+component. Because this is confounded with the overall magnitude of the BOLD
+activation vector (that is, for a fixed pattern of BOLD activation, scaling the
+entire activation vector by a constant will change the on- and off-manifold
+activation), we define the "excursion" to be the proportion of the total
+activation which is off-manifold.
+
+```{r}
+activation.on  <- apply(bold.on.manifold,  1, function(i) sqrt(sum(i^2)))
+activation.off <- apply(bold.off.manifold, 1, function(i) sqrt(sum(i^2)))
+excursion <- activation.off / (activation.on + activation.off)
+```
+
+We then standardize the excursion with respect to the baseline phase of the task
+(in this case, the first 240 imaging volumes).
+
+```{r, fig.width = 5, fig.height = 4, fig.align='center'}
+excursion.std <- (excursion - mean(excursion[1:240]))/sd(excursion[1:240])
+plot(excursion.std, type = 'l', xlab = 'TR', ylab = 'Excursion')
+abline(v = 240, col = 'red', lty = 2)
+```
+
+### Excursion for all subjects
+
+```{r}
+ComputeExcursion <- function(resting.state, bold.data) {
+    
+    # Resting state basis
+    fit.svd <- svd(resting.state)
+    eigs      <- fit.svd$d^2
+    var.exp   <- cumsum(eigs)/sum(eigs)
+    dimension <- min(which(var.exp >= .75))
+    V <- fit.svd$v[,1:dimension]
+    
+    # Projection matrix for the subspace spanned by V
+    P.on <- V %*% ginv(t(V) %*% V) %*% t(V)
+
+    # Projection onto the orthogonal complement
+    I <- diag(nrow(V))
+    P.off <- I - V %*% ginv(t(V) %*% V) %*% t(V)
+
+    # On- and off- manifold projection of the task BOLD signal
+    bold.on.manifold  <- bold.data %*% P.on
+    bold.off.manifold <- bold.data %*% P.off
+    
+    activation.on  <- apply(bold.on.manifold,  1, function(i) sqrt(sum(i^2)))
+    activation.off <- apply(bold.off.manifold, 1, function(i) sqrt(sum(i^2)))
+    excursion <- activation.off / (activation.on + activation.off)
+    excursion.std <- (excursion - mean(excursion[1:240]))/sd(excursion[1:240])
+
+    return(excursion.std)
+    
+}
+
+df.exc <- ddply(df, 'Subject', summarize,
+                'Excursion' = 
+                    ComputeExcursion(Data[[which(Scan == 'Rest')]], 
+                                     Data[[which(Scan == 'Task')]]))
+```
+
+For consistency with the behavioral data, we then average the excursion over bins
+of 16 TRs (corresponding to 8 trials).
+
+```{r, fig.width = 7, fig.height = 4, fig.align='center'}
+df.exc <- ddply(df.exc, 'Subject', summarize,
+                'Time' = 1:(length(Excursion)/16),
+                'Excursion' = rollapply(Excursion, width = 16, by = 16,
+                                        FUN = mean, align = 'left'))
+
+ggplot(df.exc, aes(x = Time, y = Excursion, group = Subject, color = Subject)) +
+    theme_classic(base_size = 17) +
+    geom_hline(yintercept = 0) + geom_vline(xintercept = 15) +
+    geom_line(alpha = .75) +
+    stat_summary(fun = mean, group = -1, geom = 'line', size = 1, color = 'black')
+```
+
+### Functional PCA
+
+The full manuscript involves a multivariate functional PCA over both days and
+both networks. In this example, with only a single excursion trajectory per
+subject, we conduct a standard univariate fPCA using the `fda` package.
+
+```{r}
+# Assemble a time x subject matrix of excursion trajectories
+excursion.data <- sapply(unique(df.exc$Subject), function(s)
+    subset(df.exc, Subject == s)$Excursion)
+
+# Create a functional data object
+# This requires the specification of timestamps for each observation (row) in
+# excursion.data. In this case, it will make no difference what we choose, but
+# note that it is often easier to manually tune smoothing parameters if the 
+# time is normalized to the interval (0,1).
+# 
+# Depending on the specific research problem, the user may want to manually
+# specify a set of basis functions. In our case, we'll use the default for
+# Data2fd(), which is a cubic spline basis with knots at each observation, and
+# smoothing penalty selected by generalized cross validation.
+argvals <- 1:nrow(excursion.data)
+excursion.fd <- Data2fd(argvals, excursion.data)
+fit.fpca <- pca.fd(excursion.fd, nharm = 2, centerfns = T)
+```
+
+The default visualization of the components, using `plot(fit.fpca)`, isn't
+particularly clear. We can evaluate the functional data objects to obtain
+the actual numeric values and create our own figures. Note that, with only 
+four subjects and very little smoothing, we can expect the components to be 
+extremely noisy.
+
+```{r}
+mean.function <- eval.fd(argvals, fit.fpca$meanfd)
+components    <- eval.fd(argvals, fit.fpca$harmonics)
+n.time  <- nrow(mean.function)
+n.comps <- ncol(components)
+
+df.fpca <- data.frame(Component = rep(paste('fPC', 1:n.comps), each = n.time),
+                      Time = 1:n.time, Excursion = as.numeric(mean.function),
+                      Loading = as.numeric(components))
+```
+
+In the manuscript, we plot the components as shaded bands around the mean function,
+where each colorband denotes an increase (or decrease) of a standard deviation from
+the mean score. So if the mean score on component 1 were S, then the first 
+colorband would be at `mean + S*loading`, and the second would be at 
+`mean + 2*S*loading`, and so forth. In this example, with only four subjects, we
+manually specify the bands to display a reasonable range of values.
+
+```{r, fig.width = 6, fig.height = 4, fig.align='center'}
+ggplot(df.fpca, aes(x = Time, y = Excursion)) +
+    facet_grid(Component ~ .) + 
+    theme_classic(base_size = 15) +
+    
+    geom_vline(xintercept = 15) +
+    geom_hline(yintercept = 0) +
+    
+    geom_ribbon(aes(ymin = Excursion, ymax = Excursion + 2*Loading), 
+                fill = "#e34a33") +
+    geom_ribbon(aes(ymin = Excursion, ymax = Excursion + 1.3*Loading), 
+                fill = "#fdbb84") +
+    geom_ribbon(aes(ymin = Excursion, ymax = Excursion + .6*Loading), 
+                fill = "#fee8c8") +
+    
+    geom_ribbon(aes(ymin = Excursion, ymax = Excursion - 2*Loading), 
+                fill = "#2b8cbe") +
+    geom_ribbon(aes(ymin = Excursion, ymax = Excursion - 1.3*Loading), 
+                fill = "#a6bddb") +
+    geom_ribbon(aes(ymin = Excursion, ymax = Excursion - .6*Loading), 
+                fill = "#ece7f2") +
+    geom_line(color = 'black') + 
+    
+    theme(strip.background = element_rect(color = 'white', fill = 'white'),
+          legend.position = 'none')
+```
+
+Notice that the first component seems to indicate the overall level of excursiion
+post-rotation, with positive scores (red) indicating more overall excursion than
+average, and negative scores (blue) indicating less than average excursion.
+The second component is noisier and less obviously interpretable, which is to be 
+expected given the small sample size in this example dataset.
+
+Referring back to the second figure, showing the excursion for each subject, we
+notice that subject S2 (in green) has greater excursion than the other subjects.
+We would then expect them to have a *higher* score on the first component. We
+can confirm this by plotting the component scores for each subject:
+
+```{r, fig.width = 5, fig.height = 3, fig.align='center'}
+df.scores <- data.frame(Subject = unique(df$Subject),
+                        Score = fit.fpca$scores[,1])
+ggplot(df.scores, aes(x = Subject, y = Score, color = Subject)) +
+    theme_classic(base_size = 17) +
+    geom_point(size = 4) +
+    ylab('Score (fPC 1)')
+```
+
+This confirms what we can see in the second figure: Subject 2 has the greatest
+overall excursion post-rotation, while Subject 4 has the least.

@@ -1,0 +1,216 @@
+---
+title: "01-covariance_centering"
+author: "Corson N. Areshenkoff"
+date: "18/03/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Required packages
+```{r, message=FALSE}
+library(plyr)
+
+# Used for covariance estimation and centering
+library(spdm)
+
+# Used for visualizing the results of centering
+library(proxy)
+library(ggplot2)
+```
+
+## Data
+
+The file `data/guides/example_data.rds` contains example BOLD data
+from 4 subjects, each with rest and task scans. The data are stored in a dataframe
+with columns for `Subject`, `Scan`, and `Data`; the latter containing TR x ROI
+matrices of (standardized) BOLD data.
+```{r}
+df <- readRDS('../data/example_data.rds')
+```
+
+## Workflow
+
+### Covariance estimation
+
+The library `spdm` implements several forms of covariance estimation though
+`spd.estimate()`, but the linear shrinkage estimator `linshrink` is a reasonable 
+default choice. In small sample settings (when the number of observations is not 
+large relative to the number of variables) the sample covariance is particularly 
+poor, and may not even be positive-definite, but regularized estimators typically 
+perform better even with large samples.
+
+We can estimate covariance matrices for all scans in one pass with
+
+```
+lapply(df$Data, spd.estimate, method = 'linshrink')
+```
+
+but as covariance estimates are biased, and this bias depends on the sample size,
+it is generally better to ensure an equal number of observations in each condition
+to avoid systematic bias when scan lengths differ. For regularized covariance 
+estimates, this is true because the shrinkage penalty is generally a function
+of the sample size. But note that this is true even for the sample covariance,
+which is biased under the natural metric on the space of covariance matrices.
+
+Unless one is interested in a particular phase of the task (e.g. early or late),
+a simple approach might be to subsample the longer scans. We can choose a number
+of observations equal to the shortest scan (the resting scans):
+
+```{r}
+n.samples <- min(sapply(df$Data, nrow))
+n.samples
+```
+
+We can then estimate the covariance over `r n.samples` equally spaced observations
+in each scan:
+
+```{r}
+df$Cov <- lapply(df$Data, function(d) {
+    idx <- round(seq(1, nrow(d), length.out = n.samples))
+    spd.estimate(d[idx,], method = 'linshrink')
+})
+```
+
+### Visualizing subject level clustering
+
+A low-dimensional embedding of the covariance matrices can be useful for 
+visualizing the success of centering. We typically use umap, but other groups
+(e.g. the midnight scan club) have used approaches such as multidimensional
+scaling with similar results. In this example, with such a small number of
+observations, we use MDS.
+
+Since our goal is to respect the natural geometry of the space of covariance
+matrices as much as possible, we perform the embedding using a distance matrix
+calculated using the intrinsic (geodesic) distance between covariance matrices.
+
+This can be done using the function `spd.dist`. Right now (as of the date listed
+above) this function is limited to computing the distance between a single pair
+of covariance matrices, and so the full distance matrix must be constructed
+manually, or using the `dist` function provided in the `proxy` library. Note that
+the distance measure we use (`riemannian`) can be quite slow in high-dimensions,
+so for large datasets with many ROIs, this can take some time.
+
+```{r}
+distance.uncentered <- proxy::dist(df$Cov, method = function(i,j) {
+    spd.dist(i, j, method = 'riemannian')
+})
+```
+
+MDS can then be performed on the distance matrix to obtain a 2-dimensional
+embedding. Note the subject level clustering.
+
+```{r, fig.width = 4, fig.height = 3, fig.align='center'}
+mds.uncentered <- cmdscale(distance.uncentered)
+pf.mds.uncentered <- data.frame(Subject = df$Subject, Scan = df$Scan,
+                                X = mds.uncentered[,1],
+                                Y = mds.uncentered[,2])
+ggplot(pf.mds.uncentered, 
+       aes(x = X, y = Y, color = Subject, shape = Scan)) +
+    theme_classic() + geom_point(size = 4)
+```
+
+### Centering
+
+The goal of centering is to account for baseline differences in subject
+functional connectivity. For example, we might want to account for overall mean
+subject difference, or differences during resting state or a baseline phase of
+a task. In this case, we'll mean-center the four subjects. The general workflow
+is as follows:
+
+    1. Compute the mean covariance for each subject
+    2. Compute the grand mean covariance
+    3. Translate each subject's covariance matrices from the subject mean to the
+    grand mean
+    
+Means can be computing using `spd.mean()`, where we set `method = 'riemannian'`
+to compute the mean in the space of covariance matrices. We do this for each 
+subject, and over all subjects.
+
+```{r}
+grand.mean <- spd.mean(df$Cov, method = 'riemannian')
+subject.means <- ddply(df, 'Subject', summarize, 
+                       'Cov' = list(spd.mean(Cov, method = 'riemannian')))
+```
+
+To perform the translation, we first project each covariance matrix onto the 
+tangent space at the corresponding subject mean. We then parallel transport
+these vectors to the grand mean, and project back onto the space of covariance
+matrices. These steps can be done, respectively, using the `spd.logmap`, 
+`spd.transport`, and `spd.expmap` functions. Alternatively, they can be done
+in a single call to the `spd.translate` function.
+
+At the moment, `spdm` lacks a convenient wrapper for centering entire datasets,
+and so this must be done for each subject.
+
+```{r}
+df$CovCen <- lapply(1:nrow(df), function(i) {
+    cov.mat <- df$Cov[[i]]
+    sub.mean <- subset(subject.means, Subject == df$Subject[i])$Cov[[1]]
+    cov.mat.cen <- spd.translate(cov.mat, from = sub.mean, to = grand.mean)
+    return(cov.mat.cen)
+})
+```
+
+The work of `spd.translate` can be done manually as follows:
+
+```
+df$CovCen <- lapply(1:nrow(df), function(i) {
+    cov.mat <- df$Cov[[i]]
+    sub.mean <- subset(subject.means, Subject == df$Subject[i])$Cov[[1]]
+    
+    # Project observed covariance onto the tangent space around
+    # the subject mean
+    tanvec <- spd.logmap(cov.mat, p = sub.mean)
+    
+    # Transport the tangent vector to the tangent space at the grand mean
+    tanvec.gm <- spd.transport(tanvec, from = sub.mean, to = grand.mean)
+    
+    # Project the transported tangent vector back to the space of
+    covariance matrices
+    cov.mat.cen <- spd.expmap(tanvec.gm, p = grand.mean)
+    
+    return(cov.mat.cen)
+})
+```
+
+We may also want to represent the centered covariance matrices as tangent vectors
+at the grand mean, since these more purely encode *differences* relative to the
+mean. These can be extracted by projecting the centered covariance matrices back
+onto the tangent space at the grand mean:
+
+```{r}
+df$TanVec <- lapply(df$CovCen, spd.logmap, p = grand.mean)
+```
+
+### Visualizing the effects of centering
+
+We can now follow essentially the same procedure as before to perform MDS
+on the centered covariance matrices.
+
+```{r}
+distance.centered <- proxy::dist(df$CovCen, method = function(i,j) {
+    spd.dist(i, j, method = 'riemannian')
+})
+```
+
+MDS can then be performed on the distance matrix to obtain a 2-dimensional
+embedding. Note that the subject level clustering has disappeared, and the first
+component (x) now clearly encodes the difference between rest and task.
+
+```{r, fig.width = 4, fig.height = 3, fig.align='center'}
+mds.centered <- cmdscale(distance.centered)
+pf.mds.centered <- data.frame(Subject = df$Subject, Scan = df$Scan,
+                              X = mds.centered[,1],
+                              Y = mds.centered[,2])
+ggplot(pf.mds.centered, 
+       aes(x = X, y = Y, color = Subject, shape = Scan)) +
+    theme_classic() + geom_point(size = 4)
+```
+
+### Output
+```{r}
+saveRDS(df, file = '../data/output_01-covariance_centering.rds')
+```

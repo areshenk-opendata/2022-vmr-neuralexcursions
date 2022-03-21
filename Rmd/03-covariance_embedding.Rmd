@@ -1,0 +1,126 @@
+---
+title: "03-covariance_embedding"
+author: "Corson N. Areshenkoff"
+date: "18/03/2022"
+output: html_document
+---
+    
+```{r setup, include=FALSE}
+set.seed(1)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Required packages
+```{r, message=FALSE}
+library(spdm)
+library(plyr)
+library(ggplot2)
+library(RColorBrewer)
+
+# Used by the joint embedding
+library(irlba)
+library(Matrix)
+
+# The embedding is implemented using the code provided by Wang et al. (2017),
+# and published in a repository at https://github.com/shangsiwang/Joint-Embedding.
+# As the code is not released with any open license, the script is not 
+# included here. It can be downloaded from the linked repository and placed
+# in the R/ subdirectory.
+source('../R/joint_embedding.R')
+```
+
+## Data
+
+The embedding is performed on the centered covariance matrices computed in
+`01-covariance_centering.Rmd`. We will also use the ROI information contained
+in the cognitive atlas file.
+```{r}
+df <- readRDS('../data/output_01-covariance_centering.rds')
+atlas <- read.csv('../data/atlas_cognitive_network.csv', header = T)
+head(atlas)
+```
+
+## Embedding
+
+Each tangent vector saved in `01-covariance_centering.Rmd` encodes the difference
+in functional connectivity relative to the grand mean covariance matrix, so that
+e.g. a positive value in entry (i,j) indicates a greater than average covariance 
+between region i and j. The embedding thus captures the main patterns of change
+in connectivity around the average.
+
+```{r}
+embedding  <- multidembed(df$TanVec, d = 2)
+components <- embedding$h
+scores     <- embedding$lambda
+```
+
+The components themselves give an embedding of the ROIs into two dimensions, 
+where regions which are located nearby tend to vary from the average in similar
+ways, and regions located closer to the origin tend not to vary much from the
+average at all.
+
+```{r, fig.width = 7, fig.height = 4, fig.align='center'}
+pf.comps <- data.frame(Network = atlas$Network,
+                       h1 = components[,1], h2 = components[,2])
+ggplot(pf.comps, aes(x = h1, y = h2, color = Network)) +
+    theme_classic(base_size = 17) +
+    geom_vline(xintercept = 0) +
+    geom_hline(yintercept = 0) +
+    scale_color_manual(values = c('#81ffb3', '#8419f1', '#f90a0a')) +
+    geom_point(size = 4)
+```
+
+These components form a basis for the space of centered tangent vectors, so that
+each tagent vector V is approximated as an additive combination
+V = s~1~H~1~ + s~2~H~2~, where s~1~ is the score on component 1, and H~1~ is the
+outer product h~1~'h~1~. These matrices H1 and H2 may be more interpretable than 
+the component plot above, as they are direct visualizations of the change in 
+covariance associated with each component.
+
+It is useful to compare these component with the grand mean covariance, so we
+compute that here and order the ROIs using hierarchical clustering. For each of 
+comparison, we will use this same ordering for the components.
+
+```{r, fig.width = 5, fig.height = 5, fig.align='center'}
+grand.mean <- spd.mean(df$Cov)
+grand.mean <- grand.mean - diag(diag(grand.mean))
+ord <- hclust(dist(grand.mean))$order
+
+network.colors <- mapvalues(atlas$Network, 
+                            from = c('DorsalAttention', 'FrontoParietal', 
+                                     'VentralAttention'),
+                            to = c('#81ffb3', '#8419f1', '#f90a0a'))
+colormap <- rev(colorRampPalette(brewer.pal(8, "Spectral"))(25))
+
+heatmap(grand.mean[ord,ord], 
+        symm = T, Rowv = NA, labRow = NA, labCol = NA,
+        RowSideColors = network.colors[ord],
+        col = colormap)
+```
+
+Note the large community comprising regions in the frontoparietal network (top left).
+The first component in particular (H1; below) appears to prominently encode a 
+relative increase or decrease in the covariance within this community, so that
+higher scores are associated with greater than average functional connectivity 
+within this subset of frontoparietal regions.
+
+```{r, fig.width = 5, fig.height = 5, fig.align='center'}
+H1 <- components[,1] %o% components[,1]
+heatmap(H1[ord,ord], 
+        symm = T, Rowv = NA, labRow = NA, labCol = NA,
+        RowSideColors = network.colors[ord],
+        col = colormap)
+```
+
+This component appears to strongly distinguish between resting state and task scans,
+with task scans showing positive scores, and thus greater functional connectivity
+within this cluster of frontoparietal regions.
+
+```{r, fig.width = 6, fig.height = 4, fig.align='center'}
+pf.scores <- data.frame(Subject = df$Subject, Scan = df$Scan,
+                        h1 = scores[,1], h2 = scores[,2])
+ggplot(pf.scores, aes(x = h1, y = h2, color = Scan)) +
+    theme_classic(base_size = 17) +
+    xlab('Score (h1)') + ylab('Score (h2)') +
+    geom_point(size = 4)
+```
